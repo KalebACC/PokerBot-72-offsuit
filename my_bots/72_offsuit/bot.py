@@ -32,6 +32,18 @@ _PREFLOP_STRENGTH = {
 _MEAN_PREFLOP_STRENGTH = sum(_PREFLOP_STRENGTH.values()) / len(_PREFLOP_STRENGTH)
 
 
+def _hand_percentiles(scores):
+  """Rank hand scores by percentile, giving ties the same rank."""
+  counts = {}
+  for score in scores:
+    counts[score] = counts.get(score, 0) + 1
+  weaker = 0
+  for score in sorted(counts):
+    count = counts[score]
+    yield score, (weaker + 0.5 * count) / len(scores)
+    weaker += count
+
+
 class Opponent:
   """Dirichlet posteriors by street and whether the opponent owes chips."""
 
@@ -42,6 +54,10 @@ class Opponent:
   }
   _LARGE_BET_PRICE = 0.4
   _RIVER_SIZE_PRIOR = 8
+
+  @classmethod
+  def is_large_bet(cls, amount_owed, pot):
+    return amount_owed / pot >= cls._LARGE_BET_PRICE
 
   def __init__(self):
     self._alpha = {
@@ -107,7 +123,7 @@ class Opponent:
         if action in alpha:
           alpha[action] += 1
           if street == "river" and facing_bet and self._pot:
-            large_bet = (highest_bet - committed) / self._pot >= self._LARGE_BET_PRICE
+            large_bet = self.is_large_bet(highest_bet - committed, self._pot)
             self._river_responses[large_bet][action] += 1
           if (street == "preflop" and facing_bet and self._preflop_raiser == our_id
               and event["hand_num"] != self._last_reraise_sample_hand):
@@ -134,7 +150,7 @@ class Opponent:
 
   def river_response_probabilities(self, amount_owed, pot, street_probabilities):
     """Blend observed responses at this price with the overall river model."""
-    large_bet = amount_owed / pot >= self._LARGE_BET_PRICE
+    large_bet = self.is_large_bet(amount_owed, pot)
     counts = self._river_responses[large_bet]
     total = sum(counts.values()) + self._RIVER_SIZE_PRIOR
     return {
@@ -194,17 +210,31 @@ class Opponent:
     pot_before_bet = max(1, game_state["pot"] - amount_owed)
     pressure = min(1.0, amount_owed / pot_before_bet)
     exponent = 1.0 + 3.0 * pressure
-    counts = {}
-    for score in hand_scores:
-      counts[score] = counts.get(score, 0) + 1
+    return {
+      score: 0.15 + 0.85 * percentile ** exponent
+      for score, percentile in _hand_percentiles(hand_scores)
+    }
 
+  def turn_response_weights(self, game_state, hand_scores):
+    """Relative weights for a call and reraise at two candidate bet sizes."""
+    our_id = game_state["your_bot_id"]
+    aggression = sum(
+      entry["street"] == "turn" and entry["bot_id"] != our_id
+      and entry["action"] in ("raise", "all_in")
+      for entry in game_state.get("action_log", [])
+    )
+    # Retain weak hands and draws, while giving more weight to made hands
+    # after turn aggression and in the ranges that continue for more chips.
+    call_floor = self.action_probabilities("turn", facing_bet=True)["call"] ** 2
+    shapes = ((max(0.35, call_floor), 2), (0.10, 5),
+              (max(0.15, call_floor), 4), (0.05, 7))
     weights = {}
-    weaker = 0
-    for score in sorted(counts):
-      count = counts[score]
-      percentile = (weaker + 0.5 * count) / len(hand_scores)
-      weights[score] = 0.15 + 0.85 * percentile ** exponent
-      weaker += count
+    for score, percentile in _hand_percentiles(hand_scores):
+      prior = 0.10 + 0.90 * percentile ** (2 + min(aggression, 3)) if aggression else 1.0
+      weights[score] = tuple(
+        prior * (floor + (1 - floor) * percentile ** power)
+        for floor, power in shapes
+      )
     return weights
 
 
@@ -217,12 +247,17 @@ def monte_carlo(game_state):
   return wins
 
 
-def _showdown_probabilities(game_state, opponent=None):
-  """Return win and tie probabilities, optionally weighting river hands."""
+def _showdown_cards(game_state):
   hole_cards = [eval7.Card(card) for card in game_state["your_cards"]]
   board = [eval7.Card(card) for card in game_state["community_cards"]]
   known_cards = set(hole_cards + board)
   unseen = [card for card in _DECK if card not in known_cards]
+  return hole_cards, board, unseen
+
+
+def _showdown_probabilities(game_state, opponent=None):
+  """Return win and tie probabilities, optionally weighting river hands."""
+  hole_cards, board, unseen = _showdown_cards(game_state)
   cards_to_come = 5 - len(board)
 
   wins = 0
@@ -259,6 +294,38 @@ def _showdown_probabilities(game_state, opponent=None):
     elif our_score == their_score:
       ties += weight
   return wins / total_weight, ties / total_weight
+
+
+def _turn_raise_equities(game_state, opponent):
+  """Estimate call and reraise equity for small and large turn raises."""
+  hole_cards, board, unseen = _showdown_cards(game_state)
+  scores = {
+    (first, second): eval7.evaluate(board + [first, second])
+    for first, second in combinations(unseen, 2)
+  }
+  ours_by_river = {river: eval7.evaluate(hole_cards + board + [river]) for river in unseen}
+  outcomes = {}
+  for _ in range(_MONTE_CARLO_TRIALS):
+    first, second, river = random.sample(unseen, 3)
+    score = scores.get((first, second))
+    if score is None:
+      score = scores[second, first]
+    ours = ours_by_river[river]
+    theirs = eval7.evaluate(board + [river, first, second])
+    points, trials = outcomes.get(score, (0.0, 0))
+    outcomes[score] = (points + (ours > theirs) + 0.5 * (ours == theirs), trials + 1)
+
+  weighted_points = [0.0] * 4
+  weighted_trials = [0.0] * 4
+  response_weights = opponent.turn_response_weights(game_state, scores.values())
+  for score, (points, trials) in outcomes.items():
+    for index, weight in enumerate(response_weights[score]):
+      weighted_points[index] += points * weight
+      weighted_trials[index] += trials * weight
+  small_call, small_raise, large_call, large_raise = (
+    points / trials for points, trials in zip(weighted_points, weighted_trials)
+  )
+  return {False: (small_call, small_raise), True: (large_call, large_raise)}
 
 
 def _equity(game_state: dict, equity=None) -> float:
@@ -460,15 +527,28 @@ def decide(game_state: dict) -> dict:
       _effective_total_bet(game_state, max(min_raise, target))
       for target in candidate_sizes
     }
+    # Use a tighter continuation range after the opponent has shown aggression.
+    turn_equities = None
+    if game_state["street"] == "turn" and not can_check:
+      turn_equities = _turn_raise_equities(game_state, _opponent)
     for target in sorted(targets):
       candidate_responses = responses
-      if game_state["street"] == "river":
+      call_equity, reraise_equity = equity, None
+      if turn_equities is not None:
+        large_bet = _opponent.is_large_bet(
+          _opponent_call_chips(game_state, target), game_state["pot"] + _additional_chips(game_state, target)
+        )
+        call_equity, reraise_equity = turn_equities[large_bet]
+      elif game_state["street"] == "river":
         candidate_responses = _opponent.river_response_probabilities(
           _opponent_call_chips(game_state, target),
           game_state["pot"] + _additional_chips(game_state, target),
           responses,
         )
-      raise_ev = ev_calc_raise(game_state, target, equity, response_probabilities=candidate_responses)
+      raise_ev = ev_calc_raise(
+        game_state, target, call_equity, response_probabilities=candidate_responses,
+        reraise_equity=reraise_equity,
+      )
       if raise_ev > best_ev:
         best_action, best_ev = {"action": "raise", "amount": target}, raise_ev
         fold_probability = candidate_responses["fold"]

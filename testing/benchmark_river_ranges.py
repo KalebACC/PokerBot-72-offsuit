@@ -8,7 +8,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 BASELINE = ROOT / "bots" / "river_range_baseline" / "bot.py"
 HERO = "river_range_baseline"
 
