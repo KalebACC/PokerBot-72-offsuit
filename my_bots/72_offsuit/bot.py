@@ -59,6 +59,127 @@ def monte_carlo(game_state):
     return wins / _MONTE_CARLO_TRIALS
 
 
+def _equity(game_state: dict, equity=None) -> float:
+    """Use supplied showdown equity, or estimate it with Monte Carlo."""
+    if equity is None:
+        equity = monte_carlo(game_state)
+    return max(0.0, min(1.0, float(equity)))
+
+
+def _fold_equity(fold_equity: float) -> float:
+    """Keep fold-equity inputs in the probability range."""
+    return max(0.0, min(1.0, float(fold_equity)))
+
+
+def _additional_chips(game_state: dict, total_bet: int) -> int:
+    """Return chips added by a bet/raise; amounts are totals this street."""
+    street_bet = int(game_state.get("your_bet_this_street", 0))
+    stack = int(game_state.get("your_stack", total_bet))
+    return max(0, min(int(total_bet) - street_bet, stack))
+
+
+def _opponent_stack(game_state: dict) -> int | None:
+    """Return the active heads-up opponent's chips behind, if known."""
+    for player in game_state.get("players", []):
+        if (
+            player.get("bot_id") != game_state.get("your_bot_id")
+            and player.get("state", "active") == "active"
+        ):
+            stack = player.get("stack")
+            return None if stack is None else int(stack)
+
+    return None
+
+
+def _effective_total_bet(game_state: dict, total_bet: int) -> int:
+    """Cap a target before calculating either player's contribution."""
+    own_max = int(game_state.get("your_bet_this_street", 0)) + int(
+        game_state.get("your_stack", total_bet)
+    )
+    opponent_stack = _opponent_stack(game_state)
+    if opponent_stack is None:
+        return min(int(total_bet), own_max)
+    opponent_max = int(game_state.get("current_bet", 0)) + opponent_stack
+    return min(int(total_bet), own_max, opponent_max)
+
+
+def _opponent_call_chips(game_state: dict, total_bet: int) -> int:
+    """Estimate one opponent's chips added when calling our total bet."""
+    call_amount = max(0, int(total_bet) - int(game_state.get("current_bet", 0)))
+    opponent_stack = _opponent_stack(game_state)
+    if opponent_stack is None:
+        return call_amount
+    return min(call_amount, opponent_stack)
+
+
+def ev_calc_fold(game_state: dict) -> float:
+    """EV of folding now, measured from the current decision point."""
+    return 0.0
+
+
+def ev_calc_check(game_state: dict, equity=None) -> float:
+    """EV of checking: showdown equity multiplied by the current pot."""
+    return _equity(game_state, equity) * float(game_state["pot"])
+
+
+def ev_calc_call(game_state: dict, equity=None) -> float:
+    """EV of calling heads-up, assuming no further betting."""
+    equity = _equity(game_state, equity)
+    amount_owed = float(game_state["amount_owed"])
+    your_stack = float(game_state.get("your_stack", amount_owed))
+
+    call_cost = min(amount_owed, your_stack)
+    uncalled_chips = amount_owed - call_cost
+    showdown_pot = float(game_state["pot"]) - uncalled_chips + call_cost
+
+    return equity * showdown_pot - call_cost
+
+def ev_calc_bet(
+    game_state: dict,
+    bet_to: int,
+    equity=None,
+    fold_equity: float = 0.0,
+    opponent_call_chips=None,
+) -> float:
+    """EV of betting heads-up, assuming a call leads to showdown."""
+    equity = _equity(game_state, equity)
+    fold_equity = _fold_equity(fold_equity)
+
+    opponent_street_bet = int(game_state.get("current_bet", 0))
+    effective_bet_to = _effective_total_bet(game_state, bet_to)
+
+    if opponent_call_chips is not None:
+        max_call = max(0, int(opponent_call_chips))
+        effective_bet_to = min(
+            effective_bet_to, opponent_street_bet + max_call
+        )
+
+    chips_added = _additional_chips(game_state, effective_bet_to)
+    call_cost = max(0, effective_bet_to - opponent_street_bet)
+
+    pot = float(game_state["pot"])
+    showdown_pot = pot + chips_added + call_cost
+    showdown_ev = equity * showdown_pot - chips_added
+
+    return fold_equity * pot + (1.0 - fold_equity) * showdown_ev
+
+def ev_calc_raise(
+    game_state: dict,
+    raise_to: int,
+    equity=None,
+    fold_equity: float = 0.0,
+    opponent_call_chips=None,
+) -> float:
+    """EV of raising to ``raise_to``; this is not a raise-by amount."""
+    return ev_calc_bet(
+        game_state,
+        raise_to,
+        equity,
+        fold_equity,
+        opponent_call_chips,
+    )
+
+
 def decide(game_state: dict) -> dict:
     """
     game_state (the most useful keys):
