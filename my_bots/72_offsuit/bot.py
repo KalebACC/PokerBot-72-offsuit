@@ -11,6 +11,78 @@ import eval7
 
 _DECK = tuple(eval7.Deck().cards)
 _MONTE_CARLO_TRIALS = 5000
+_RANKS = "23456789TJQKA"
+
+
+def _preflop_hand_score(first, second):
+  """Return a stable score used for conservative preflop decisions."""
+  first_rank, second_rank = _RANKS.index(first[0]), _RANKS.index(second[0])
+  high, low = max(first_rank, second_rank), min(first_rank, second_rank)
+  if high == low:
+    return 100 + high * 4
+
+  score = high * 4 + low
+  if first[1] == second[1]:
+    score += 8
+  gap = high - low
+  if gap <= 1:
+    score += 5
+  elif gap == 2:
+    score += 2
+  return score
+
+
+def _preflop_range_allows(first, second, facing_raise=False, raise_action=False):
+  """Keep weak offsuit hands out of early pots until evidence justifies them."""
+  first_rank, second_rank = _RANKS.index(first[0]), _RANKS.index(second[0])
+  high, low = max(first_rank, second_rank), min(first_rank, second_rank)
+  suited = first[1] == second[1]
+
+  if high == low:
+    return high >= (5 if facing_raise and raise_action else 0)  # 77+ reraises, all pairs can continue.
+
+  if facing_raise and not raise_action:
+    # Defending is wider than reraising in heads-up play. This prevents the
+    # bot from folding profitable calls such as A6 offsuit to a small raise.
+    return (
+      high == 12
+      or high == low
+      or (suited and high >= 7 and low >= 4)
+      or (high == 11 and low >= 5)
+      or (high == 10 and low >= 7)
+      or (high == 9 and low >= 7)
+    )
+
+  if facing_raise:
+    return (
+      (suited and high == 12)  # Any suited ace.
+      or (suited and high == 11 and low >= 9)  # KTs+.
+      or (suited and high == 10 and low >= 9)  # QTs+.
+      or (suited and high == 9 and low >= 8)   # JTs.
+      or (high == 12 and low >= 10)            # AQo+.
+      or (high == 11 and low == 10)            # KQo.
+    )
+
+  if high == 12:  # Any ace is a reasonable heads-up open.
+    return True
+  if suited:
+    return (
+      (high == 11 and low >= 2)  # K4s+.
+      or (high == 10 and low >= 4)  # Q6s+.
+      or (high == 9 and low >= 5)   # J7s+.
+      or (high == 8 and low >= 5)   # T7s+.
+      or (high == 7 and low >= 5)   # 97s+.
+      or (high == 6 and low >= 4)   # 86s+.
+      or (high == 5 and low >= 3)   # 75s+.
+      or (high == 4 and low >= 2)   # 64s+.
+    )
+  return (
+    (high == 11 and low >= 5)  # K7o+.
+    or (high == 10 and low >= 6)  # Q8o+.
+    or (high == 9 and low >= 6)   # J8o+.
+    or (high == 8 and low >= 6)   # T8o+.
+    or (high == 7 and low >= 6)   # 98o.
+  )
 
 
 def _preflop_strength(first, second):
@@ -54,6 +126,13 @@ class Opponent:
   }
   _LARGE_BET_PRICE = 0.4
   _RIVER_SIZE_PRIOR = 8
+  _PRIORS = {
+    # A check is much more common than an all-in before evidence is available.
+    ("preflop", False): {"fold": 0.5, "check": 6.0, "raise": 3.0, "all_in": 0.15},
+    ("preflop", True): {"fold": 4.0, "call": 5.0, "raise": 2.0, "all_in": 0.15},
+    ("postflop", False): {"fold": 0.5, "check": 5.0, "raise": 2.0, "all_in": 0.1},
+    ("postflop", True): {"fold": 3.0, "call": 5.0, "raise": 2.0, "all_in": 0.1},
+  }
 
   @classmethod
   def is_large_bet(cls, amount_owed, pot):
@@ -61,10 +140,16 @@ class Opponent:
 
   def __init__(self):
     self._alpha = {
-      (street, facing_bet): dict.fromkeys(actions, 1)
+      (street, facing_bet): {}
       for street in self._STREETS
       for facing_bet, actions in self._ACTIONS.items()
     }
+    for street in self._STREETS:
+      context = "preflop" if street == "preflop" else "postflop"
+      for facing_bet, actions in self._ACTIONS.items():
+        self._alpha[street, facing_bet] = {
+          action: self._PRIORS[context, facing_bet][action] for action in actions
+        }
     self._previous_log = []
     self._round = None
     self._bets = {}
@@ -142,11 +227,45 @@ class Opponent:
         self._pot += event["amount"] if action == "ante" else self._bets.get(actor, 0) - committed
     self._previous_log = [event.copy() for event in log]
 
-  def action_probabilities(self, street, facing_bet):
-    """Return posterior means for a street and opponent betting context."""
+  def action_probabilities(self, street, facing_bet, bet_size=None, pot=None):
+    """Return posterior means, adjusting fold equity for the offered price."""
     alpha = self._alpha[street, facing_bet]
     total = sum(alpha.values())
-    return {action: count / total for action, count in alpha.items()}
+    probabilities = {action: count / total for action, count in alpha.items()}
+    if not facing_bet or bet_size is None or not pot:
+      return probabilities
+
+    price = max(0.0, float(bet_size) / max(1.0, float(pot)))
+    fold_multiplier = min(1.5, max(0.65, 0.75 + 0.5 * price))
+    old_fold = probabilities["fold"]
+    new_fold = min(0.9, old_fold * fold_multiplier)
+    remaining = 1.0 - old_fold
+    if remaining:
+      scale = (1.0 - new_fold) / remaining
+      for action in probabilities:
+        if action != "fold":
+          probabilities[action] *= scale
+    probabilities["fold"] = new_fold
+    return probabilities
+
+  def range_weight(self, game_state, first, second):
+    """Weight sampled opponent hands using the action currently being faced."""
+    strength = _PREFLOP_STRENGTH.get((first, second)) or _PREFLOP_STRENGTH[second, first]
+    relative_strength = strength / _MEAN_PREFLOP_STRENGTH
+    our_id = game_state.get("your_bot_id")
+    street = game_state.get("street")
+    action = next(
+      (event["action"] for event in reversed(game_state.get("action_log", []))
+       if event["street"] == street and event["bot_id"] != our_id),
+      None,
+    )
+    if action in ("raise", "all_in"):
+      tilt = 0.65
+    elif action == "call":
+      tilt = 0.25
+    else:
+      tilt = self.preflop_range_tilt(game_state) if street == "preflop" else 0.0
+    return max(0.2, min(3.0, 1.0 + tilt * (relative_strength - 1.0)))
 
   def river_response_probabilities(self, amount_owed, pot, street_probabilities):
     """Blend observed responses at this price with the overall river model."""
@@ -288,6 +407,8 @@ def _showdown_probabilities(game_state, opponent=None):
       first, second = draw[:2]
       strength = _PREFLOP_STRENGTH.get((first, second)) or _PREFLOP_STRENGTH[second, first]
       weight += tilt * (strength / _MEAN_PREFLOP_STRENGTH - 1.0)
+    if opponent is not None:
+      weight *= opponent.range_weight(game_state, draw[0], draw[1])
     total_weight += weight
     if our_score > their_score:
       wins += weight
@@ -339,6 +460,17 @@ def _equity(game_state: dict, equity=None) -> float:
 def _fold_equity(fold_equity: float) -> float:
   """Keep fold-equity inputs in the probability range."""
   return max(0.0, min(1.0, float(fold_equity)))
+
+
+def _risk_adjusted_equity(game_state, equity, total_bet):
+  """Discount noisy equity estimates when a decision risks a large pot."""
+  equity = _equity(game_state, equity)
+  chips_added = _additional_chips(game_state, total_bet)
+  pot = max(1.0, float(game_state["pot"]))
+  stack = max(1.0, float(game_state.get("your_stack", chips_added)))
+  exposure = max(chips_added / pot, chips_added / stack)
+  uncertainty = min(0.04, max(0.0, exposure - 0.5) * 0.08)
+  return max(0.0, equity - uncertainty)
 
 
 def _additional_chips(game_state: dict, total_bet: int) -> int:
@@ -449,12 +581,12 @@ def ev_calc_raise(
   if response_probabilities is None:
     return ev_calc_bet(game_state, raise_to, equity, fold_equity, opponent_call_chips)
 
-  equity = _equity(game_state, equity)
-  if reraise_equity is None:
-    reraise_equity = equity
   pot = game_state["pot"]
   current_bet = game_state["current_bet"]
   raise_to = _effective_total_bet(game_state, raise_to)
+  equity = _risk_adjusted_equity(game_state, equity, raise_to)
+  if reraise_equity is None:
+    reraise_equity = equity
   chips_added = _additional_chips(game_state, raise_to)
   matched_pot = pot + chips_added + _opponent_call_chips(game_state, raise_to)
   call_ev = equity * matched_pot - chips_added
@@ -462,6 +594,7 @@ def ev_calc_raise(
   effective_max = _effective_total_bet(
     game_state, game_state["your_bet_this_street"] + game_state["your_stack"]
   )
+  reraise_equity = _risk_adjusted_equity(game_state, reraise_equity, effective_max)
   # Model a regular reraise as pot-sized, subject to the minimum and stacks.
   min_increment = max(game_state["min_raise_to"] - current_bet, raise_to - current_bet)
   reraise_to = min(effective_max, raise_to + max(min_increment, matched_pot))
@@ -478,6 +611,17 @@ def ev_calc_raise(
     + response_probabilities["call"] * call_ev
     + response_probabilities["raise"] * response_ev(reraise_to)
     + response_probabilities["all_in"] * response_ev(effective_max)
+  )
+
+
+def _facing_preflop_raise(game_state):
+  """Return whether the opponent has raised before our current decision."""
+  if game_state.get("street") != "preflop":
+    return False
+  our_id = game_state.get("your_bot_id")
+  return any(
+    event["bot_id"] != our_id and event["action"] in ("raise", "all_in")
+    for event in game_state.get("action_log", [])
   )
 
 
@@ -501,25 +645,29 @@ def decide(game_state: dict) -> dict:
 
   fold_probability = None
   min_raise = game_state["min_raise_to"]
+  facing_preflop_raise = _facing_preflop_raise(game_state)
+  preflop_allowed = True
+  preflop_raise_allowed = True
+  if game_state.get("street") == "preflop":
+    first, second = game_state["your_cards"]
+    preflop_allowed = _preflop_range_allows(
+      first, second, facing_raise=facing_preflop_raise
+    )
+    preflop_raise_allowed = _preflop_range_allows(
+      first, second, facing_raise=facing_preflop_raise, raise_action=True
+    )
+    # The generic random-hand equity is too optimistic for weak unopened hands.
+    # Let the big blind check, but do not call or open the weakest small-blind hands.
+    if not preflop_allowed and not can_check and not facing_preflop_raise:
+      best_action, best_ev = {"action": "fold"}, ev_calc_fold(game_state)
+
   # Avoid bloating the pot with a bluff after a reraise from a tighter range.
   preflop_tilt = _opponent.preflop_range_tilt(game_state)
   avoid_reraise = preflop_tilt >= 0.15 and equity < 0.5
-  if (not avoid_reraise and _opponent_stack(game_state)
+  if (preflop_raise_allowed and not avoid_reraise and _opponent_stack(game_state)
       and _effective_total_bet(game_state, min_raise) == min_raise):
-    responses = _opponent.action_probabilities(
-      game_state["street"], facing_bet=True
-    )
-    fold_probability = responses["fold"]
     pot_after_call = game_state["pot"] + game_state["amount_owed"]
     current_bet = game_state["current_bet"]
-    facing_preflop_raise = (
-      game_state["street"] == "preflop"
-      and not can_check
-      and any(
-        event["bot_id"] != game_state["your_bot_id"] and event["action"] in ("raise", "all_in")
-        for event in game_state.get("action_log", [])
-      )
-    )
     candidate_sizes = [min_raise, current_bet + pot_after_call // 2]
     if not facing_preflop_raise:
       candidate_sizes.append(current_bet + pot_after_call)
@@ -532,7 +680,12 @@ def decide(game_state: dict) -> dict:
     if game_state["street"] == "turn" and not can_check:
       turn_equities = _turn_raise_equities(game_state, _opponent)
     for target in sorted(targets):
-      candidate_responses = responses
+      candidate_responses = _opponent.action_probabilities(
+        game_state["street"], facing_bet=True,
+        bet_size=_opponent_call_chips(game_state, target),
+        pot=game_state["pot"] + _additional_chips(game_state, target),
+      )
+      fold_probability = candidate_responses["fold"]
       call_equity, reraise_equity = equity, None
       if turn_equities is not None:
         large_bet = _opponent.is_large_bet(
@@ -543,13 +696,15 @@ def decide(game_state: dict) -> dict:
         candidate_responses = _opponent.river_response_probabilities(
           _opponent_call_chips(game_state, target),
           game_state["pot"] + _additional_chips(game_state, target),
-          responses,
+          candidate_responses,
         )
       raise_ev = ev_calc_raise(
         game_state, target, call_equity, response_probabilities=candidate_responses,
         reraise_equity=reraise_equity,
       )
-      if raise_ev > best_ev:
+      chips_added = _additional_chips(game_state, target)
+      raise_margin = max(25.0, 0.05 * game_state["pot"], 0.02 * chips_added)
+      if raise_ev > best_ev + raise_margin:
         best_action, best_ev = {"action": "raise", "amount": target}, raise_ev
         fold_probability = candidate_responses["fold"]
 
