@@ -10,7 +10,7 @@ from itertools import combinations
 import eval7
 
 _DECK = tuple(eval7.Deck().cards)
-_MONTE_CARLO_TRIALS = 5000
+_MONTE_CARLO_TRIALS = 20_000
 
 
 def _preflop_strength(first, second):
@@ -73,6 +73,7 @@ class Opponent:
       large_bet: dict.fromkeys(self._ACTIONS[True], 0) for large_bet in (False, True)
     }
     self._round_complete = False
+    self._preflop_has_raise = False
     self._preflop_raiser = None
     self._last_reraise_sample_hand = None
     self._reraise_chances = 0
@@ -97,6 +98,7 @@ class Opponent:
       self._bets = {}
       self._round_complete = first["action"] in ("ante", "small_blind")
       self._pot = 0 if self._round_complete else None
+      self._preflop_has_raise = False
       self._preflop_raiser = None
 
     our_id = game_state["your_bot_id"]
@@ -111,6 +113,7 @@ class Opponent:
         self._round = betting_round
         self._bets = {}
         self._round_complete = True
+        self._preflop_has_raise = False
         self._preflop_raiser = None
 
       actor = event["bot_id"]
@@ -120,11 +123,15 @@ class Opponent:
       if actor != our_id and self._round_complete:
         facing_bet = committed < highest_bet
         alpha = self._alpha[street, facing_bet]
-        if action in alpha:
-          alpha[action] += 1
+        # The small blind acts first even when we have made no raise.
+        facing_only_blinds = street == "preflop" and facing_bet and not self._preflop_has_raise
+        # An all-in total at or below the live bet is a short or exact call.
+        response = "call" if action == "all_in" and facing_bet and event["amount"] <= highest_bet else action
+        if response in alpha and not facing_only_blinds:
+          alpha[response] += 1
           if street == "river" and facing_bet and self._pot:
             large_bet = self.is_large_bet(highest_bet - committed, self._pot)
-            self._river_responses[large_bet][action] += 1
+            self._river_responses[large_bet][response] += 1
           if (street == "preflop" and facing_bet and self._preflop_raiser == our_id
               and event["hand_num"] != self._last_reraise_sample_hand):
             # Multiple raises in a single hand are correlated evidence.
@@ -137,6 +144,7 @@ class Opponent:
       elif action in ("raise", "all_in"):
         self._bets[actor] = event["amount"]
         if street == "preflop" and event["amount"] > highest_bet:
+          self._preflop_has_raise = True
           self._preflop_raiser = actor if action == "raise" else None
       if self._pot is not None:
         self._pot += event["amount"] if action == "ante" else self._bets.get(actor, 0) - committed
@@ -210,8 +218,13 @@ class Opponent:
     pot_before_bet = max(1, game_state["pot"] - amount_owed)
     pressure = min(1.0, amount_owed / pot_before_bet)
     exponent = 1.0 + 3.0 * pressure
+    floor = 0.15
+    if game_state["your_bet_this_street"] and (pressure >= 0.4 or last_response == "all_in"):
+      # A raise over our river bet filters out more marginal hands than a lead.
+      exponent += 2.0 + 2.0 * pressure
+      floor = 0.035 if last_response == "all_in" else 0.065
     return {
-      score: 0.15 + 0.85 * percentile ** exponent
+      score: floor + (1 - floor) * percentile ** exponent
       for score, percentile in _hand_percentiles(hand_scores)
     }
 
@@ -255,6 +268,35 @@ def _showdown_cards(game_state):
   return hole_cards, board, unseen
 
 
+def _postflop_reraise_weights(game_state, board, unseen):
+  """Weight opponent hands when their aggression follows our investment."""
+  owed = game_state["amount_owed"]
+  if not owed:
+    return None
+  our_id = game_state["your_bot_id"]
+  opponent_raises = [
+    event for event in game_state.get("action_log", [])
+    if event["street"] == game_state["street"] and event["bot_id"] != our_id
+    and event["action"] in ("raise", "all_in")
+  ]
+  if not opponent_raises:
+    return None
+  shove = opponent_raises[-1]["action"] == "all_in"
+  if not shove and not game_state["your_bet_this_street"]:
+    return None
+  pressure = min(1.0, owed / max(1, game_state["pot"] - owed))
+  power = 1.5 + 4 * pressure + min(2, len(opponent_raises) - 1)
+  # Keep missed draws and bluffs in the distribution, including on shove lines.
+  floor = 0.12 if shove else 0.24
+  scores = {
+    (first, second): eval7.evaluate(board + [first, second])
+    for first, second in combinations(unseen, 2)
+  }
+  weights = {score: floor + (1 - floor) * p ** power
+             for score, p in _hand_percentiles(scores.values())}
+  return {pair: weights[score] for pair, score in scores.items()}
+
+
 def _showdown_probabilities(game_state, opponent=None):
   """Return win and tie probabilities, optionally weighting river hands."""
   hole_cards, board, unseen = _showdown_cards(game_state)
@@ -277,6 +319,10 @@ def _showdown_probabilities(game_state, opponent=None):
     return wins / total_weight, ties / total_weight
 
   tilt = opponent.preflop_range_tilt(game_state) if opponent else 0.0
+  postflop_weights = (
+    _postflop_reraise_weights(game_state, board, unseen)
+    if opponent and cards_to_come in (1, 2) else None
+  )
   total_weight = 0.0
   for _ in range(_MONTE_CARLO_TRIALS):
     draw = random.sample(unseen, 2 + cards_to_come)
@@ -288,6 +334,9 @@ def _showdown_probabilities(game_state, opponent=None):
       first, second = draw[:2]
       strength = _PREFLOP_STRENGTH.get((first, second)) or _PREFLOP_STRENGTH[second, first]
       weight += tilt * (strength / _MEAN_PREFLOP_STRENGTH - 1.0)
+    elif postflop_weights is not None:
+      first, second = draw[:2]
+      weight = postflop_weights.get((first, second)) or postflop_weights[second, first]
     total_weight += weight
     if our_score > their_score:
       wins += weight
@@ -326,6 +375,46 @@ def _turn_raise_equities(game_state, opponent):
     points / trials for points, trials in zip(weighted_points, weighted_trials)
   )
   return {False: (small_call, small_raise), True: (large_call, large_raise)}
+
+
+def _river_turn_prior(game_state):
+  if game_state["street"] != "river" or not game_state["can_check"]:
+    return None
+  actions = [event for event in game_state.get("action_log", [])
+             if event["street"] == "turn" and event["bot_id"] != game_state["your_bot_id"]]
+  if any(event["action"] in ("raise", "all_in") for event in actions):
+    return 0.20, 3
+  if 6 * sum(event["amount"] for event in actions if event["action"] == "call") >= game_state["pot"]:
+    return 0.35, 2
+  return None
+
+
+def _river_raise_equities(game_state, opponent, turn_prior=None):
+  """Compute equity against the ranges that continue after a river raise."""
+  hole_cards, board, unseen = _showdown_cards(game_state)
+  ours = eval7.evaluate(hole_cards + board)
+  pairs = list(combinations(unseen, 2))
+  scores = [eval7.evaluate(board + list(pair)) for pair in pairs]
+  percentiles = dict(_hand_percentiles(scores))
+  observed = opponent.river_range_weights(game_state, scores)
+  weights = [observed[score] if observed is not None else 1.0 for score in scores]
+  if turn_prior is not None:
+    floor, power = turn_prior
+    turn_scores = [eval7.evaluate(board[:4] + list(pair)) for pair in pairs]
+    turn_weights = {score: floor + (1 - floor) * p ** power
+                    for score, p in _hand_percentiles(turn_scores)}
+    weights = [weight * turn_weights[score] for weight, score in zip(weights, turn_scores)]
+  points = [(ours > score) + 0.5 * (ours == score) for score in scores]
+  raw_equity = sum(weight * point for weight, point in zip(weights, points)) / sum(weights)
+  call_rate = opponent.action_probabilities("river", facing_bet=True)["call"]
+  shapes = ((max(0.50, call_rate), 2), (0.12, 5),
+            (max(0.24, call_rate), 4), (0.06, 7))
+  outcomes = []
+  for floor, exponent in shapes:
+    continuation = [weight * (floor + (1 - floor) * percentiles[score] ** exponent)
+                    for weight, score in zip(weights, scores)]
+    outcomes.append(sum(weight * point for weight, point in zip(continuation, points)) / sum(continuation))
+  return raw_equity, {False: tuple(outcomes[:2]), True: tuple(outcomes[2:])}
 
 
 def _equity(game_state: dict, equity=None) -> float:
@@ -489,8 +578,13 @@ def decide(game_state: dict) -> dict:
     return {"action": "check"}
 
   _opponent.observe(game_state)
-  wins, ties = _showdown_probabilities(game_state, _opponent)
-  equity = wins + 0.5 * ties
+  turn_prior = _river_turn_prior(game_state)
+  river_equities = None
+  if turn_prior is not None:
+    equity, river_equities = _river_raise_equities(game_state, _opponent, turn_prior)
+  else:
+    wins, ties = _showdown_probabilities(game_state, _opponent)
+    equity = wins + 0.5 * ties
   can_check = game_state["can_check"]
   best_action = {"action": "check" if can_check else "fold"}
   best_ev = ev_calc_check(game_state, equity) if can_check else ev_calc_fold(game_state)
@@ -512,6 +606,10 @@ def decide(game_state: dict) -> dict:
     fold_probability = responses["fold"]
     pot_after_call = game_state["pot"] + game_state["amount_owed"]
     current_bet = game_state["current_bet"]
+    marginal_flop_reraise = (
+      game_state["street"] == "flop" and not can_check
+      and game_state["your_bet_this_street"] > 0 and equity < 0.60
+    )
     facing_preflop_raise = (
       game_state["street"] == "preflop"
       and not can_check
@@ -528,22 +626,26 @@ def decide(game_state: dict) -> dict:
       for target in candidate_sizes
     }
     # Use a tighter continuation range after the opponent has shown aggression.
-    turn_equities = None
+    continuation_equities = river_equities
     if game_state["street"] == "turn" and not can_check:
-      turn_equities = _turn_raise_equities(game_state, _opponent)
+      continuation_equities = _turn_raise_equities(game_state, _opponent)
+    elif game_state["street"] == "river" and not can_check:
+      _, continuation_equities = _river_raise_equities(game_state, _opponent)
     for target in sorted(targets):
+      # When already raised on the flop, avoid building a big pot with
+      # a marginal hand while the opponent's continuation range is uncertain.
+      if marginal_flop_reraise and 5 * (target - current_bet) >= pot_after_call:
+        continue
       candidate_responses = responses
       call_equity, reraise_equity = equity, None
-      if turn_equities is not None:
-        large_bet = _opponent.is_large_bet(
-          _opponent_call_chips(game_state, target), game_state["pot"] + _additional_chips(game_state, target)
-        )
-        call_equity, reraise_equity = turn_equities[large_bet]
-      elif game_state["street"] == "river":
+      opponent_owed = _opponent_call_chips(game_state, target)
+      pot_with_raise = game_state["pot"] + _additional_chips(game_state, target)
+      if continuation_equities is not None:
+        large_bet = _opponent.is_large_bet(opponent_owed, pot_with_raise)
+        call_equity, reraise_equity = continuation_equities[large_bet]
+      if game_state["street"] == "river":
         candidate_responses = _opponent.river_response_probabilities(
-          _opponent_call_chips(game_state, target),
-          game_state["pot"] + _additional_chips(game_state, target),
-          responses,
+          opponent_owed, pot_with_raise, responses,
         )
       raise_ev = ev_calc_raise(
         game_state, target, call_equity, response_probabilities=candidate_responses,
