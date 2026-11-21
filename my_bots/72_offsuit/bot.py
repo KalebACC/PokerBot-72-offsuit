@@ -84,6 +84,38 @@ class Opponent:
     total = sum(alpha.values())
     return {action: count / total for action, count in alpha.items()}
 
+  def river_range_weights(self, game_state, hand_scores):
+    """Weight possible hands after an observed river bet or raise."""
+    amount_owed = game_state.get("amount_owed", 0)
+    if not amount_owed:
+      return None
+
+    our_id = game_state.get("your_bot_id")
+    last_response = next(
+      (event["action"] for event in reversed(game_state.get("action_log", []))
+       if event["street"] == "river" and event["bot_id"] != our_id),
+      None,
+    )
+    if last_response not in ("raise", "all_in"):
+      return None
+
+    # Larger bets tilt the range toward higher ranks. The floor retains bluffs.
+    pot_before_bet = max(1, game_state["pot"] - amount_owed)
+    pressure = min(1.0, amount_owed / pot_before_bet)
+    exponent = 1.0 + 3.0 * pressure
+    counts = {}
+    for score in hand_scores:
+      counts[score] = counts.get(score, 0) + 1
+
+    weights = {}
+    weaker = 0
+    for score in sorted(counts):
+      count = counts[score]
+      percentile = (weaker + 0.5 * count) / len(hand_scores)
+      weights[score] = 0.15 + 0.85 * percentile ** exponent
+      weaker += count
+    return weights
+
 
 _opponent = Opponent()
 
@@ -94,8 +126,8 @@ def monte_carlo(game_state):
   return wins
 
 
-def _showdown_probabilities(game_state):
-  """Return win and tie probabilities against uniformly random cards."""
+def _showdown_probabilities(game_state, opponent=None):
+  """Return win and tie probabilities, optionally weighting river hands."""
   hole_cards = [eval7.Card(card) for card in game_state["your_cards"]]
   board = [eval7.Card(card) for card in game_state["community_cards"]]
   known_cards = set(hole_cards + board)
@@ -106,12 +138,17 @@ def _showdown_probabilities(game_state):
   ties = 0
   if cards_to_come == 0:
     our_score = eval7.evaluate(hole_cards + board)
-    for first, second in combinations(unseen, 2):
-      their_score = eval7.evaluate(board + [first, second])
-      wins += our_score > their_score
-      ties += our_score == their_score
-    trials = len(unseen) * (len(unseen) - 1) // 2
-    return wins / trials, ties / trials
+    scores = [eval7.evaluate(board + [first, second]) for first, second in combinations(unseen, 2)]
+    weights = opponent.river_range_weights(game_state, scores) if opponent else None
+    total_weight = 0.0
+    for score in scores:
+      weight = weights[score] if weights is not None else 1.0
+      total_weight += weight
+      if our_score > score:
+        wins += weight
+      elif our_score == score:
+        ties += weight
+    return wins / total_weight, ties / total_weight
 
   for _ in range(_MONTE_CARLO_TRIALS):
     draw = random.sample(unseen, 2 + cards_to_come)
@@ -284,7 +321,8 @@ def decide(game_state: dict) -> dict:
     return {"action": "check"}
 
   _opponent.observe(game_state)
-  equity = _equity(game_state)
+  wins, ties = _showdown_probabilities(game_state, _opponent)
+  equity = wins + 0.5 * ties
   can_check = game_state["can_check"]
   best_action = {"action": "check" if can_check else "fold"}
   best_ev = ev_calc_check(game_state, equity) if can_check else ev_calc_fold(game_state)
