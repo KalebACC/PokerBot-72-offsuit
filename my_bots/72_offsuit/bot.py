@@ -1,25 +1,7 @@
-"""
-Bot template. Copy this folder to my_bots/<your_team>/ and write decide().
+"""Heads-up Texas Hold'em bot for 72 Offsuit.
 
-  - decide() is called once per decision and has 2 seconds to return, or your
-    bot folds. Crashes and invalid actions also fold; your bot stays in the game.
-  - You may use the Python 3.10 standard library, eval7, numpy, scipy, treys
-    and scikit-learn. Nothing else is installed in the sandbox.
-  - No network, no file writes, no subprocesses, no eval/exec. You may read
-    your own data/ folder, at import time only.
-  - Check your bot before submitting:  make validate BOT=my_bots/<your_team>
-
-The full list of what decide() receives is in the README ("What your bot
-sees"); the most useful keys are summarised below.
-
-RETURN FORMAT:
-  {"action": "fold"}
-  {"action": "check"}                       # only when can_check is True
-  {"action": "call"}
-  {"action": "raise", "amount": 1200}       # amount = your TOTAL bet this street
-  {"action": "all_in"}
-
-CARDS are strings like "As" (ace of spades) or "Td" (ten of diamonds).
+See the README's "What your bot sees" section for the game-state fields and
+action format. Run `make validate BOT=my_bots/72_offsuit` before submitting.
 """
 
 import random
@@ -31,68 +13,128 @@ _DECK = tuple(eval7.Deck().cards)
 _MONTE_CARLO_TRIALS = 5000
 
 
+class Opponent:
+  """Dirichlet posteriors by street and whether the opponent owes chips."""
+
+  _STREETS = ("preflop", "flop", "turn", "river")
+  _ACTIONS = {
+    False: ("fold", "check", "raise", "all_in"),
+    True: ("fold", "call", "raise", "all_in"),
+  }
+
+  def __init__(self):
+    self._alpha = {
+      (street, facing_bet): dict.fromkeys(actions, 1)
+      for street in self._STREETS
+      for facing_bet, actions in self._ACTIONS.items()
+    }
+    self._previous_log = []
+    self._round = None
+    self._bets = {}
+    self._round_complete = False
+
+  def observe(self, game_state):
+    """Update the model once per new action in the rolling match log."""
+    log = game_state.get("match_action_log")
+    if not log:
+      return
+
+    # An older prefix can fall out of the rolling log between decisions.
+    # Match its overlap before filtering out our actions, posts, and shows.
+    overlap = min(len(log), len(self._previous_log))
+    while overlap and self._previous_log[-overlap:] != log[:overlap]:
+      overlap -= 1
+
+    if not overlap:
+      # If the log opens mid-round, the missing bets can change the context.
+      first = log[0]
+      self._round = (first["hand_num"], first["street"])
+      self._bets = {}
+      self._round_complete = first["action"] in ("ante", "small_blind")
+
+    our_id = game_state["your_bot_id"]
+    for event in log[overlap:]:
+      street = event["street"]
+      if street not in self._STREETS:
+        continue
+      betting_round = (event["hand_num"], street)
+      if betting_round != self._round:
+        self._round = betting_round
+        self._bets = {}
+        self._round_complete = True
+
+      actor = event["bot_id"]
+      action = event["action"]
+      committed = self._bets.get(actor, 0)
+      if actor != our_id and self._round_complete:
+        facing_bet = committed < max(self._bets.values(), default=0)
+        alpha = self._alpha[street, facing_bet]
+        if action in alpha:
+          alpha[action] += 1
+
+      if action in ("small_blind", "big_blind", "call"):
+        self._bets[actor] = committed + event["amount"]
+      elif action in ("raise", "all_in"):
+        self._bets[actor] = event["amount"]
+    self._previous_log = [event.copy() for event in log]
+
+  def action_probabilities(self, street, facing_bet):
+    """Return posterior means for a street and opponent betting context."""
+    alpha = self._alpha[street, facing_bet]
+    total = sum(alpha.values())
+    return {action: count / total for action, count in alpha.items()}
+
+
+_opponent = Opponent()
+
+
 def monte_carlo(game_state):
-    """Return the probability of winning outright at a heads-up showdown.
+  """Return the probability of winning outright at a heads-up showdown.
+  Assume uniformly random opponent cards and board runouts from the unseen
+  deck. Ties do not count as wins. Enumerate all opponent hands on the river.
+  """
+  hole_cards = [eval7.Card(card) for card in game_state["your_cards"]]
+  board = [eval7.Card(card) for card in game_state["community_cards"]]
+  known_cards = set(hole_cards + board)
+  unseen = [card for card in _DECK if card not in known_cards]
+  cards_to_come = 5 - len(board)
 
-    Assume uniformly random opponent cards and board runouts from the unseen
-    deck. Ties do not count as wins. Enumerate all opponent hands on the river.
-    """
-    hole_cards = [eval7.Card(card) for card in game_state["your_cards"]]
-    board = [eval7.Card(card) for card in game_state["community_cards"]]
-    known_cards = set(hole_cards + board)
-    unseen = [card for card in _DECK if card not in known_cards]
-    cards_to_come = 5 - len(board)
+  wins = 0
+  if cards_to_come == 0:
+    our_score = eval7.evaluate(hole_cards + board)
+    for first, second in combinations(unseen, 2):
+      if our_score > eval7.evaluate(board + [first, second]):
+        wins += 1
+    return wins / (len(unseen) * (len(unseen) - 1) // 2)
 
-    wins = 0
-    if cards_to_come == 0:
-        our_score = eval7.evaluate(hole_cards + board)
-        for first, second in combinations(unseen, 2):
-            if our_score > eval7.evaluate(board + [first, second]):
-                wins += 1
-        return wins / (len(unseen) * (len(unseen) - 1) // 2)
-
-    for _ in range(_MONTE_CARLO_TRIALS):
-        draw = random.sample(unseen, 2 + cards_to_come)
-        final_board = board + draw[2:]
-        if eval7.evaluate(hole_cards + final_board) > eval7.evaluate(draw[:2] + final_board):
-            wins += 1
-    return wins / _MONTE_CARLO_TRIALS
+  for _ in range(_MONTE_CARLO_TRIALS):
+    draw = random.sample(unseen, 2 + cards_to_come)
+    final_board = board + draw[2:]
+    if eval7.evaluate(hole_cards + final_board) > eval7.evaluate(draw[:2] + final_board):
+      wins += 1
+  return wins / _MONTE_CARLO_TRIALS
 
 
 def decide(game_state: dict) -> dict:
-    """
-    game_state (the most useful keys):
-      your_cards        ["Ah", "Kh"]
-      community_cards   [] preflop, then 3, 4, 5 cards
-      street            "preflop" | "flop" | "turn" | "river"
-      pot, current_bet, min_raise_to, amount_owed, can_check
-      your_stack, your_bet_this_street, your_bot_id
-      blinds            {"sb", "bb", "ante"} for this hand (they rise every 20 hands)
-      hand_num          hand number in this match, from 0
-      button_seat, sb_seat, bb_seat, seat_to_act
-      players           public info per seat: seat, bot_id, stack, state, bet_this_street, ...
-      action_log        every action this hand: {"seat", "bot_id", "action", "amount", "street"}
-      match_action_log  the last 200 actions across the match, with "hand_num", plus
-                        {"action": "show", "cards": [...]} for each player at a showdown
+  """Pick an action using the starter strategy.
 
-    Debugging: anything you print() is saved with the decision, and you can add
-    a JSON-serialisable "debug" value to what you return, e.g.
-    {"action": "call", "debug": {"equity": 0.4}}. Run with: python3 play.py --show
-    """
-    if game_state.get("type") == "warmup":     # one call before hand 1; load things here if you like
-        return {"action": "check"}
+  The engine sends a warmup request at the start of each match. During play,
+  a reply can include a JSON-serializable "debug" value alongside the action.
+  """
+  global _opponent
+  if game_state.get("type") == "warmup":
+    _opponent = Opponent()
+    return {"action": "check"}
 
-    # ── Your strategy goes here. This example is deliberately simple. ──────────
-    cards = game_state["your_cards"]
-    pot = game_state["pot"]
-    owed = game_state["amount_owed"]
+  _opponent.observe(game_state)
 
-    ranks = [c[0] for c in cards]
-    if ranks[0] == ranks[1] and ranks[0] in "AKQJ":           # big pocket pair: raise
-        raise_to = max(game_state["min_raise_to"], game_state["current_bet"] + pot)
-        return {"action": "raise", "amount": raise_to}
-    if game_state["can_check"]:
-        return {"action": "check"}
-    if owed <= pot * 0.25:                                     # cheap to continue: call
-        return {"action": "call"}
-    return {"action": "fold"}
+  first_card, second_card = game_state["your_cards"]
+  pot = game_state["pot"]
+
+  if first_card[0] == second_card[0] and first_card[0] in "AKQJ":
+    raise_to = max(game_state["min_raise_to"], game_state["current_bet"] + pot)
+    return {"action": "raise", "amount": raise_to}
+  if game_state["can_check"]:
+    return {"action": "check"}
+  action = "call" if game_state["amount_owed"] <= pot * 0.25 else "fold"
+  return {"action": action}

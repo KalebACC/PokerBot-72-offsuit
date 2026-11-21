@@ -1,5 +1,7 @@
 # The libraries bots may use, at the versions installed in the sandbox image
-# (pokercore/sandbox/Dockerfile). eval7==0.1.7 is installed separately: see `make install`.
+# (pokercore/sandbox/Dockerfile). Use `make install` with Python 3.10
+# to prepare eval7's build dependency before installing these packages.
+eval7==0.1.7
 numpy==1.26.4
 scipy==1.13.0
 treys==0.1.8
