@@ -9,8 +9,7 @@ check-python:
 install: check-python
 	@echo ">> eval7 needs Cython<3 at build time and won't find it through build isolation"
 	$(PYTHON) -m pip install "Cython<3"
-	$(PYTHON) -m pip install --no-build-isolation eval7==0.1.7
-	$(PYTHON) -m pip install -r requirements.txt
+	$(PYTHON) -m pip install --no-build-isolation -r requirements.txt
 
 sandbox:
 	@echo ">> Building the bot sandbox image (the same one the tournament uses)"
