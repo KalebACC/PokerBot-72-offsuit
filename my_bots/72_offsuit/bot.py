@@ -8,6 +8,7 @@ import random
 from itertools import combinations
 
 import eval7
+import numpy as np
 
 _DECK = tuple(eval7.Deck().cards)
 _MONTE_CARLO_TRIALS = 5000
@@ -37,7 +38,7 @@ class Opponent:
     """Update the model once per new action in the rolling match log."""
     log = game_state.get("match_action_log")
     if not log:
-      return
+      return []
 
     # An older prefix can fall out of the rolling log between decisions.
     # Match its overlap before filtering out our actions, posts, and shows.
@@ -77,6 +78,7 @@ class Opponent:
       elif action in ("raise", "all_in"):
         self._bets[actor] = event["amount"]
     self._previous_log = [event.copy() for event in log]
+    return log[overlap:]
 
   def action_probabilities(self, street, facing_bet):
     """Return posterior means for a street and opponent betting context."""
@@ -86,6 +88,166 @@ class Opponent:
 
 
 _opponent = Opponent()
+
+
+_CARD_NAMES = tuple(str(card) for card in _DECK)
+_CARD_IDS = {name: index for index, name in enumerate(_CARD_NAMES)}
+_HAND_COMBOS = np.asarray(
+  list(combinations(range(len(_DECK)), 2)), dtype=np.uint8
+)
+_COMBO_COUNT = len(_HAND_COMBOS)
+_RANK_VALUES = {rank: value for value, rank in enumerate("23456789TJQKA", 2)}
+
+
+def _card_ids(cards):
+  return {_CARD_IDS[card] for card in cards}
+
+
+def _preflop_strengths():
+  """Return a rough 0..1 prior strength for each exact preflop combo."""
+  strengths = np.empty(_COMBO_COUNT, dtype=np.float32)
+  for index, (first, second) in enumerate(_HAND_COMBOS):
+    first_rank = _RANK_VALUES[_CARD_NAMES[first][0]]
+    second_rank = _RANK_VALUES[_CARD_NAMES[second][0]]
+    high, low = max(first_rank, second_rank), min(first_rank, second_rank)
+    suited = _CARD_NAMES[first][1] == _CARD_NAMES[second][1]
+    pair_bonus = 0.35 if first_rank == second_rank else 0.0
+    suited_bonus = 0.06 if suited else 0.0
+    connected_bonus = max(0, 5 - high + low) * 0.008
+    strengths[index] = min(
+      1.0,
+      (high - 2) / 12.0 * 0.62
+      + (low - 2) / 12.0 * 0.22
+      + pair_bonus + suited_bonus + connected_bonus,
+    )
+  return strengths
+
+
+_PREFLOP_STRENGTHS = _preflop_strengths()
+
+
+class OpponentRange:
+  """A log-weighted distribution over all exact opponent hole-card combos."""
+
+  _ACTION_SHARPNESS = {
+    "fold": 1.0,
+    "check": 0.8,
+    "call": 1.1,
+    "raise": 1.5,
+    "all_in": 1.8,
+  }
+
+  def __init__(self):
+    self._log_weights = np.zeros(_COMBO_COUNT, dtype=np.float32)
+    self._hand_num = None
+
+  def reset(self, hand_num=None):
+    self._log_weights.fill(0.0)
+    self._hand_num = hand_num
+
+  def _strengths(self, game_state):
+    board = game_state.get("community_cards", [])
+    if not board:
+      return _PREFLOP_STRENGTHS
+
+    board_cards = [eval7.Card(card) for card in board]
+    scores = np.full(_COMBO_COUNT, -np.inf, dtype=np.float32)
+    for index, (first, second) in enumerate(_HAND_COMBOS):
+      if _CARD_NAMES[first] in board or _CARD_NAMES[second] in board:
+        continue
+      scores[index] = eval7.evaluate(
+        [eval7.Card(_CARD_NAMES[first]), eval7.Card(_CARD_NAMES[second])]
+        + board_cards
+      )
+
+    legal = np.isfinite(scores)
+    legal_scores = scores[legal]
+    order = np.argsort(legal_scores)
+    ranks = np.empty(len(legal_scores), dtype=np.float32)
+    ranks[order] = np.linspace(0.0, 1.0, len(legal_scores), dtype=np.float32)
+    strengths = np.zeros(_COMBO_COUNT, dtype=np.float32)
+    strengths[legal] = ranks
+    return strengths
+
+  def _legal_mask(self, game_state):
+    known = _card_ids(
+      list(game_state.get("your_cards", []))
+      + list(game_state.get("community_cards", []))
+    )
+    return np.asarray(
+      [first not in known and second not in known for first, second in _HAND_COMBOS],
+      dtype=bool,
+    )
+
+  @staticmethod
+  def _likelihood(action, strength):
+    """Soft action likelihood; never hard-eliminates a merely unlikely hand."""
+    strength = np.clip(strength, 0.0, 1.0)
+    sharpness = OpponentRange._ACTION_SHARPNESS.get(action, 1.0)
+    if action == "fold":
+      likelihood = 1.0 - 0.90 * strength
+    elif action == "check":
+      likelihood = 1.0 - 0.55 * strength
+    elif action == "call":
+      likelihood = 0.15 + 0.85 * (1.0 - np.abs(strength - 0.58))
+    else:
+      likelihood = 0.05 + 0.95 * strength
+    return np.maximum(0.01, likelihood) ** sharpness
+
+  def observe(self, game_state, events):
+    """Condition the range on newly observed opponent actions."""
+    hand_num = game_state.get("hand_num")
+    if hand_num != self._hand_num:
+      self.reset(hand_num)
+
+    legal = self._legal_mask(game_state)
+    self._log_weights[~legal] = -np.inf
+    strengths = self._strengths(game_state)
+    opponent_id = game_state.get("your_bot_id")
+
+    for event in events:
+      if event.get("bot_id") == opponent_id:
+        continue
+      action = event.get("action")
+      if action == "show" and len(event.get("cards", [])) == 2:
+        shown = set(event["cards"])
+        exact = np.asarray(
+          [{_CARD_NAMES[first], _CARD_NAMES[second]} == shown
+           for first, second in _HAND_COMBOS],
+          dtype=bool,
+        )
+        self._log_weights[~exact] = -np.inf
+        continue
+      if action not in self._ACTION_SHARPNESS:
+        continue
+      likelihood = self._likelihood(action, strengths)
+      self._log_weights[legal] += np.log(likelihood[legal])
+
+    self._log_weights[~legal] = -np.inf
+
+  def probabilities(self, game_state):
+    legal = self._legal_mask(game_state)
+    values = self._log_weights.copy()
+    values[~legal] = -np.inf
+    maximum = np.max(values)
+    if not np.isfinite(maximum):
+      values[legal] = 0.0
+      maximum = 0.0
+    probabilities = np.exp(values - maximum)
+    probabilities[~legal] = 0.0
+    total = probabilities.sum()
+    if total <= 0.0:
+      probabilities[legal] = 1.0 / max(1, legal.sum())
+      return probabilities
+    return probabilities / total
+
+  def sample(self, game_state, count, rng):
+    probabilities = self.probabilities(game_state)
+    return rng.choice(_COMBO_COUNT, size=count, p=probabilities)
+
+
+_opponent_range = OpponentRange()
+_RANGE_RNG = np.random.default_rng()
 
 
 def monte_carlo(game_state):
@@ -115,10 +277,38 @@ def monte_carlo(game_state):
   return wins / _MONTE_CARLO_TRIALS
 
 
+def weighted_monte_carlo(game_state, opponent_range=None, trials=512):
+  """Estimate equity by sampling opponent hands from the live weighted range."""
+  if opponent_range is None:
+    opponent_range = _opponent_range
+
+  hole_cards = [eval7.Card(card) for card in game_state["your_cards"]]
+  board = [eval7.Card(card) for card in game_state["community_cards"]]
+  known_ids = _card_ids(game_state["your_cards"] + game_state["community_cards"])
+  cards_to_come = 5 - len(board)
+  sampled_combos = opponent_range.sample(game_state, trials, _RANGE_RNG)
+
+  wins = 0
+  for combo_index in sampled_combos:
+    first, second = _HAND_COMBOS[combo_index]
+    opponent_cards = [eval7.Card(_CARD_NAMES[first]), eval7.Card(_CARD_NAMES[second])]
+    blocked = known_ids | {int(first), int(second)}
+    available = [card_id for card_id in range(len(_DECK)) if card_id not in blocked]
+    if cards_to_come:
+      draw_ids = _RANGE_RNG.choice(available, size=cards_to_come, replace=False)
+      runout = [eval7.Card(_CARD_NAMES[int(card_id)]) for card_id in draw_ids]
+    else:
+      runout = []
+    final_board = board + runout
+    if eval7.evaluate(hole_cards + final_board) > eval7.evaluate(opponent_cards + final_board):
+      wins += 1
+  return wins / max(1, trials)
+
+
 def _equity(game_state: dict, equity=None) -> float:
-    """Use supplied showdown equity, or estimate it with Monte Carlo."""
+    """Use supplied equity, or estimate it from the weighted opponent range."""
     if equity is None:
-        equity = monte_carlo(game_state)
+        equity = weighted_monte_carlo(game_state)
     return max(0.0, min(1.0, float(equity)))
 
 
@@ -245,17 +435,37 @@ def decide(game_state: dict) -> dict:
   global _opponent
   if game_state.get("type") == "warmup":
     _opponent = Opponent()
+    _opponent_range.reset()
     return {"action": "check"}
 
-  _opponent.observe(game_state)
+  new_events = _opponent.observe(game_state)
+  _opponent_range.observe(game_state, new_events)
+  equity = weighted_monte_carlo(game_state, _opponent_range)
 
   first_card, second_card = game_state["your_cards"]
   pot = game_state["pot"]
 
   if first_card[0] == second_card[0] and first_card[0] in "AKQJ":
     raise_to = max(game_state["min_raise_to"], game_state["current_bet"] + pot)
-    return {"action": "raise", "amount": raise_to}
+    fold_equity = _opponent.action_probabilities(
+      game_state["street"], True
+    )["fold"]
+    return {
+      "action": "raise",
+      "amount": raise_to,
+      "debug": {
+        "equity": equity,
+        "ev": ev_calc_raise(game_state, raise_to, equity, fold_equity),
+        "fold_equity": fold_equity,
+      },
+    }
   if game_state["can_check"]:
-    return {"action": "check"}
-  action = "call" if game_state["amount_owed"] <= pot * 0.25 else "fold"
-  return {"action": action}
+    return {
+      "action": "check",
+      "debug": {"equity": equity, "ev": ev_calc_check(game_state, equity)},
+    }
+
+  call_ev = ev_calc_call(game_state, equity)
+  if call_ev >= 0.0:
+    return {"action": "call", "debug": {"equity": equity, "ev": call_ev}}
+  return {"action": "fold", "debug": {"equity": equity, "ev": ev_calc_fold(game_state)}}
