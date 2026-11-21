@@ -40,6 +40,8 @@ class Opponent:
     False: ("fold", "check", "raise", "all_in"),
     True: ("fold", "call", "raise", "all_in"),
   }
+  _LARGE_BET_PRICE = 0.4
+  _RIVER_SIZE_PRIOR = 8
 
   def __init__(self):
     self._alpha = {
@@ -50,6 +52,10 @@ class Opponent:
     self._previous_log = []
     self._round = None
     self._bets = {}
+    self._pot = None
+    self._river_responses = {
+      large_bet: dict.fromkeys(self._ACTIONS[True], 0) for large_bet in (False, True)
+    }
     self._round_complete = False
     self._preflop_raiser = None
     self._reraise_chances = 0
@@ -73,6 +79,7 @@ class Opponent:
       self._round = (first["hand_num"], first["street"])
       self._bets = {}
       self._round_complete = first["action"] in ("ante", "small_blind")
+      self._pot = 0 if self._round_complete else None
       self._preflop_raiser = None
 
     our_id = game_state["your_bot_id"]
@@ -82,6 +89,8 @@ class Opponent:
         continue
       betting_round = (event["hand_num"], street)
       if betting_round != self._round:
+        if event["hand_num"] != self._round[0]:
+          self._pot = 0
         self._round = betting_round
         self._bets = {}
         self._round_complete = True
@@ -96,6 +105,9 @@ class Opponent:
         alpha = self._alpha[street, facing_bet]
         if action in alpha:
           alpha[action] += 1
+          if street == "river" and facing_bet and self._pot:
+            large_bet = (highest_bet - committed) / self._pot >= self._LARGE_BET_PRICE
+            self._river_responses[large_bet][action] += 1
           if street == "preflop" and facing_bet and self._preflop_raiser == our_id:
             self._reraise_chances += 1
             self._reraises += action in ("raise", "all_in") and event["amount"] > highest_bet
@@ -106,6 +118,8 @@ class Opponent:
         self._bets[actor] = event["amount"]
         if street == "preflop" and event["amount"] > highest_bet:
           self._preflop_raiser = actor if action == "raise" else None
+      if self._pot is not None:
+        self._pot += event["amount"] if action == "ante" else self._bets.get(actor, 0) - committed
     self._previous_log = [event.copy() for event in log]
 
   def action_probabilities(self, street, facing_bet):
@@ -113,6 +127,16 @@ class Opponent:
     alpha = self._alpha[street, facing_bet]
     total = sum(alpha.values())
     return {action: count / total for action, count in alpha.items()}
+
+  def river_response_probabilities(self, amount_owed, pot, street_probabilities):
+    """Blend observed responses at this price with the overall river model."""
+    large_bet = amount_owed / pot >= self._LARGE_BET_PRICE
+    counts = self._river_responses[large_bet]
+    total = sum(counts.values()) + self._RIVER_SIZE_PRIOR
+    return {
+      action: (count + self._RIVER_SIZE_PRIOR * street_probabilities[action]) / total
+      for action, count in counts.items()
+    }
 
   def preflop_range_tilt(self, game_state):
     """Mix in a value range only when the opponent reraises our preflop bet."""
@@ -417,9 +441,17 @@ def decide(game_state: dict) -> dict:
       for target in candidate_sizes
     }
     for target in sorted(targets):
-      raise_ev = ev_calc_raise(game_state, target, equity, response_probabilities=responses)
+      candidate_responses = responses
+      if game_state["street"] == "river":
+        candidate_responses = _opponent.river_response_probabilities(
+          _opponent_call_chips(game_state, target),
+          game_state["pot"] + _additional_chips(game_state, target),
+          responses,
+        )
+      raise_ev = ev_calc_raise(game_state, target, equity, response_probabilities=candidate_responses)
       if raise_ev > best_ev:
         best_action, best_ev = {"action": "raise", "amount": target}, raise_ev
+        fold_probability = candidate_responses["fold"]
 
   best_action["debug"] = {"equity": equity, "fold_probability": fold_probability, "ev": best_ev}
   return best_action
