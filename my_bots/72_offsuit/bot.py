@@ -33,7 +33,6 @@ _MONTE_CARLO_TRIALS = 5000
 
 def monte_carlo(game_state):
     """Return the probability of winning outright at a heads-up showdown.
-
     Assume uniformly random opponent cards and board runouts from the unseen
     deck. Ties do not count as wins. Enumerate all opponent hands on the river.
     """
@@ -57,7 +56,6 @@ def monte_carlo(game_state):
         if eval7.evaluate(hole_cards + final_board) > eval7.evaluate(draw[:2] + final_board):
             wins += 1
     return wins / _MONTE_CARLO_TRIALS
-
 
 def decide(game_state: dict) -> dict:
     """
