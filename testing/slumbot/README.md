@@ -19,6 +19,11 @@ fails. Slumbot deals the cards and resets both stacks to 200 big blinds each
 hand. The script checks that returned winnings agree with the betting history
 and reports net chips and big blinds per 100 hands.
 
+Add `--log testing/slumbot/session.jsonl` to record the decisions and payouts.
+The log keeps the public betting sequence, pot odds inputs, bot equity and EV,
+and the action sent to Slumbot. It records opponent cards only when revealed
+at showdown. Use a new filename for each session.
+
 Run this harness from `testing/`. Submit the entry from `my_bots/72_offsuit/`.
 
 [Slumbot API example](https://slumbot.com/sample_api.py)

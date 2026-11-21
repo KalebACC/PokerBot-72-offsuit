@@ -117,7 +117,12 @@ def encode_action(reply, owed, current_bet, minimum, maximum, opponent_stack):
     return f"b{min(max(target, minimum), maximum)}"
 
 
-def play_hand(session, bot, hand_num, history):
+def write_event(output, event_type, hand_num, **details):
+    if output is not None:
+        print(json.dumps(dict(type=event_type, hand_num=hand_num, **details)), file=output, flush=True)
+
+
+def play_hand(session, bot, hand_num, history, output=None):
     response = session.request("new_hand")
     for _ in range(100):
         hero = response["client_pos"]
@@ -139,6 +144,12 @@ def play_hand(session, bot, hand_num, history):
                 for player, cards in ((hero, response["hole_cards"]), (1 - hero, response["bot_hole_cards"])):
                     history.append(dict(hand_num=hand_num, seat=player, bot_id=names[player],
                                         action="show", amount=0, street="showdown", cards=cards))
+            write_event(
+                output, "hand_end", hand_num, seat=hero, winnings=winnings,
+                betting=response["action"], board=response["board"], your_cards=response["hole_cards"],
+                opponent_cards=response.get("bot_hole_cards") if folded is None else None,
+                folded=folded, your_contribution=own_paid, opponent_contribution=opponent_paid,
+            )
             return winnings, hero
 
         if seat != hero or folded is not None or len(response["board"]) != (0, 3, 4, 5)[street]:
@@ -168,6 +179,15 @@ def play_hand(session, bot, hand_num, history):
             raise RuntimeError(f"Tournament bot decision failed: {reply['error']}")
         action = encode_action(reply, owed, current_bet, minimum,
                                committed[hero] + stacks[hero], stacks[1 - hero])
+        write_event(
+            output, "decision", hand_num, seat=hero, street=state["street"],
+            betting=response["action"], board=state["community_cards"], your_cards=state["your_cards"],
+            pot=state["pot"], amount_owed=owed, your_stack=stacks[hero],
+            opponent_stack=stacks[1 - hero], your_bet_this_street=committed[hero],
+            current_bet=current_bet, min_raise_to=minimum, action=reply["action"],
+            amount=reply.get("amount"), sent_action=action, think_ms=reply.get("think_ms"),
+            debug=reply.get("debug"),
+        )
         response = session.request("act", incr=action)
     raise RuntimeError("Slumbot hand did not finish within the decision limit.")
 
@@ -176,6 +196,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hands", type=int, default=12)
     parser.add_argument("--bot", type=Path, default=ROOT / "my_bots/72_offsuit")
+    parser.add_argument("--log", type=Path, help="Write decisions and completed hands to a new JSONL file")
     args = parser.parse_args()
     if args.hands < 1 or not (args.bot / "bot.py").is_file():
         parser.error("Use a positive hand count and a bot directory containing bot.py.")
@@ -185,11 +206,14 @@ def main():
     net = completed = 0
     seats = Counter()
     history = deque(maxlen=200)
+    output = None
     try:
+        if args.log:
+            output = args.log.open("x", encoding="utf-8")
         if not bot.warmup().get("ok"):
             raise RuntimeError(f"Tournament sandbox warmup failed: {bot.errors}")
         for hand in range(args.hands):
-            winnings, hero = play_hand(session, bot, hand, history)
+            winnings, hero = play_hand(session, bot, hand, history, output)
             net += winnings
             completed += 1
             seats[hero] += 1
@@ -198,6 +222,8 @@ def main():
         print(f"Benchmark stopped after {completed} completed hands: {error}", file=sys.stderr)
     finally:
         bot.stop()
+        if output is not None:
+            output.close()
     if completed:
         print(f"{completed} hands ({seats[1]} SB, {seats[0]} BB), {net:+,} chips, "
               f"{net / completed:+,.1f} bb/100")
