@@ -251,10 +251,13 @@ _RANGE_RNG = np.random.default_rng()
 
 
 def monte_carlo(game_state):
-  """Return the probability of winning outright at a heads-up showdown.
-  Assume uniformly random opponent cards and board runouts from the unseen
-  deck. Ties do not count as wins. Enumerate all opponent hands on the river.
-  """
+  """Return the probability of winning outright at a heads-up showdown."""
+  wins, _ = _showdown_probabilities(game_state)
+  return wins
+
+
+def _showdown_probabilities(game_state):
+  """Return win and tie probabilities against uniformly random cards."""
   hole_cards = [eval7.Card(card) for card in game_state["your_cards"]]
   board = [eval7.Card(card) for card in game_state["community_cards"]]
   known_cards = set(hole_cards + board)
@@ -262,19 +265,24 @@ def monte_carlo(game_state):
   cards_to_come = 5 - len(board)
 
   wins = 0
+  ties = 0
   if cards_to_come == 0:
     our_score = eval7.evaluate(hole_cards + board)
     for first, second in combinations(unseen, 2):
-      if our_score > eval7.evaluate(board + [first, second]):
-        wins += 1
-    return wins / (len(unseen) * (len(unseen) - 1) // 2)
+      their_score = eval7.evaluate(board + [first, second])
+      wins += our_score > their_score
+      ties += our_score == their_score
+    trials = len(unseen) * (len(unseen) - 1) // 2
+    return wins / trials, ties / trials
 
   for _ in range(_MONTE_CARLO_TRIALS):
     draw = random.sample(unseen, 2 + cards_to_come)
     final_board = board + draw[2:]
-    if eval7.evaluate(hole_cards + final_board) > eval7.evaluate(draw[:2] + final_board):
-      wins += 1
-  return wins / _MONTE_CARLO_TRIALS
+    our_score = eval7.evaluate(hole_cards + final_board)
+    their_score = eval7.evaluate(draw[:2] + final_board)
+    wins += our_score > their_score
+    ties += our_score == their_score
+  return wins / _MONTE_CARLO_TRIALS, ties / _MONTE_CARLO_TRIALS
 
 
 def weighted_monte_carlo(game_state, opponent_range=None, trials=512):
@@ -427,11 +435,7 @@ def ev_calc_raise(
 
 
 def decide(game_state: dict) -> dict:
-  """Pick an action using the starter strategy.
-
-  The engine sends a warmup request at the start of each match. During play,
-  a reply can include a JSON-serializable "debug" value alongside the action.
-  """
+  """Choose the candidate with the highest approximate chip EV."""
   global _opponent
   if game_state.get("type") == "warmup":
     _opponent = Opponent()
@@ -441,31 +445,30 @@ def decide(game_state: dict) -> dict:
   new_events = _opponent.observe(game_state)
   _opponent_range.observe(game_state, new_events)
   equity = weighted_monte_carlo(game_state, _opponent_range)
+  can_check = game_state["can_check"]
+  best_action = {"action": "check" if can_check else "fold"}
+  best_ev = ev_calc_check(game_state, equity) if can_check else ev_calc_fold(game_state)
+  if not can_check:
+    call_ev = ev_calc_call(game_state, equity)
+    if call_ev > best_ev:
+      best_action, best_ev = {"action": "call"}, call_ev
 
-  first_card, second_card = game_state["your_cards"]
-  pot = game_state["pot"]
-
-  if first_card[0] == second_card[0] and first_card[0] in "AKQJ":
-    raise_to = max(game_state["min_raise_to"], game_state["current_bet"] + pot)
-    fold_equity = _opponent.action_probabilities(
-      game_state["street"], True
+  fold_probability = None
+  min_raise = game_state["min_raise_to"]
+  if _opponent_stack(game_state) and _effective_total_bet(game_state, min_raise) == min_raise:
+    fold_probability = _opponent.action_probabilities(
+      game_state["street"], facing_bet=True
     )["fold"]
-    return {
-      "action": "raise",
-      "amount": raise_to,
-      "debug": {
-        "equity": equity,
-        "ev": ev_calc_raise(game_state, raise_to, equity, fold_equity),
-        "fold_equity": fold_equity,
-      },
+    pot_after_call = game_state["pot"] + game_state["amount_owed"]
+    current_bet = game_state["current_bet"]
+    targets = {
+      _effective_total_bet(game_state, max(min_raise, target))
+      for target in (min_raise, current_bet + pot_after_call // 2, current_bet + pot_after_call)
     }
-  if game_state["can_check"]:
-    return {
-      "action": "check",
-      "debug": {"equity": equity, "ev": ev_calc_check(game_state, equity)},
-    }
+    for target in sorted(targets):
+      raise_ev = ev_calc_raise(game_state, target, equity, fold_probability)
+      if raise_ev > best_ev:
+        best_action, best_ev = {"action": "raise", "amount": target}, raise_ev
 
-  call_ev = ev_calc_call(game_state, equity)
-  if call_ev >= 0.0:
-    return {"action": "call", "debug": {"equity": equity, "ev": call_ev}}
-  return {"action": "fold", "debug": {"equity": equity, "ev": ev_calc_fold(game_state)}}
+  best_action["debug"] = {"equity": equity, "fold_probability": fold_probability, "ev": best_ev}
+  return best_action
