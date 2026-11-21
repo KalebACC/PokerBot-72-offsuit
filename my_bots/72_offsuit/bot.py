@@ -13,6 +13,25 @@ _DECK = tuple(eval7.Deck().cards)
 _MONTE_CARLO_TRIALS = 5000
 
 
+def _preflop_strength(first, second):
+  """Give premium and strong starting hands more mass in a value range."""
+  ranks = sorted((first[0], second[0]), key="23456789TJQKA".index, reverse=True)
+  hand = "".join(ranks)
+  suited = first[1] == second[1]
+  if hand in ("AA", "KK", "QQ", "JJ", "AK") or (hand == "AQ" and suited):
+    return 10
+  if hand in ("TT", "99", "88", "77", "AQ") or (suited and hand in ("AJ", "AT", "KQ")):
+    return 4
+  return 1
+
+
+_PREFLOP_STRENGTH = {
+  (first, second): _preflop_strength(str(first), str(second))
+  for first, second in combinations(_DECK, 2)
+}
+_MEAN_PREFLOP_STRENGTH = sum(_PREFLOP_STRENGTH.values()) / len(_PREFLOP_STRENGTH)
+
+
 class Opponent:
   """Dirichlet posteriors by street and whether the opponent owes chips."""
 
@@ -32,6 +51,9 @@ class Opponent:
     self._round = None
     self._bets = {}
     self._round_complete = False
+    self._preflop_raiser = None
+    self._reraise_chances = 0
+    self._reraises = 0
 
   def observe(self, game_state):
     """Update the model once per new action in the rolling match log."""
@@ -51,6 +73,7 @@ class Opponent:
       self._round = (first["hand_num"], first["street"])
       self._bets = {}
       self._round_complete = first["action"] in ("ante", "small_blind")
+      self._preflop_raiser = None
 
     our_id = game_state["your_bot_id"]
     for event in log[overlap:]:
@@ -62,20 +85,27 @@ class Opponent:
         self._round = betting_round
         self._bets = {}
         self._round_complete = True
+        self._preflop_raiser = None
 
       actor = event["bot_id"]
       action = event["action"]
       committed = self._bets.get(actor, 0)
+      highest_bet = max(self._bets.values(), default=0)
       if actor != our_id and self._round_complete:
-        facing_bet = committed < max(self._bets.values(), default=0)
+        facing_bet = committed < highest_bet
         alpha = self._alpha[street, facing_bet]
         if action in alpha:
           alpha[action] += 1
+          if street == "preflop" and facing_bet and self._preflop_raiser == our_id:
+            self._reraise_chances += 1
+            self._reraises += action in ("raise", "all_in") and event["amount"] > highest_bet
 
       if action in ("small_blind", "big_blind", "call"):
         self._bets[actor] = committed + event["amount"]
       elif action in ("raise", "all_in"):
         self._bets[actor] = event["amount"]
+        if street == "preflop" and event["amount"] > highest_bet:
+          self._preflop_raiser = actor if action == "raise" else None
     self._previous_log = [event.copy() for event in log]
 
   def action_probabilities(self, street, facing_bet):
@@ -83,6 +113,23 @@ class Opponent:
     alpha = self._alpha[street, facing_bet]
     total = sum(alpha.values())
     return {action: count / total for action, count in alpha.items()}
+
+  def preflop_range_tilt(self, game_state):
+    """Mix in a value range only when the opponent reraises our preflop bet."""
+    if game_state.get("street") != "preflop" or not game_state.get("amount_owed"):
+      return 0.0
+    our_id = game_state["your_bot_id"]
+    our_raise = False
+    for event in game_state.get("action_log", []):
+      if event["action"] not in ("raise", "all_in"):
+        continue
+      if event["bot_id"] == our_id:
+        our_raise = True
+      elif our_raise and event["amount"] > game_state["your_bet_this_street"]:
+        # Start with three reraises in ten hypothetical opportunities.
+        rate = (self._reraises + 3) / (self._reraise_chances + 10)
+        return 0.6 * max(0.0, 1.0 - rate / 0.65)
+    return 0.0
 
   def river_range_weights(self, game_state, hand_scores):
     """Weight possible hands after an observed river bet or raise."""
@@ -150,14 +197,24 @@ def _showdown_probabilities(game_state, opponent=None):
         ties += weight
     return wins / total_weight, ties / total_weight
 
+  tilt = opponent.preflop_range_tilt(game_state) if opponent else 0.0
+  total_weight = 0.0
   for _ in range(_MONTE_CARLO_TRIALS):
     draw = random.sample(unseen, 2 + cards_to_come)
     final_board = board + draw[2:]
     our_score = eval7.evaluate(hole_cards + final_board)
     their_score = eval7.evaluate(draw[:2] + final_board)
-    wins += our_score > their_score
-    ties += our_score == their_score
-  return wins / _MONTE_CARLO_TRIALS, ties / _MONTE_CARLO_TRIALS
+    weight = 1.0
+    if tilt:
+      first, second = draw[:2]
+      strength = _PREFLOP_STRENGTH.get((first, second)) or _PREFLOP_STRENGTH[second, first]
+      weight += tilt * (strength / _MEAN_PREFLOP_STRENGTH - 1.0)
+    total_weight += weight
+    if our_score > their_score:
+      wins += weight
+    elif our_score == their_score:
+      ties += weight
+  return wins / total_weight, ties / total_weight
 
 
 def _equity(game_state: dict, equity=None) -> float:
@@ -333,16 +390,31 @@ def decide(game_state: dict) -> dict:
 
   fold_probability = None
   min_raise = game_state["min_raise_to"]
-  if _opponent_stack(game_state) and _effective_total_bet(game_state, min_raise) == min_raise:
+  # Avoid bloating the pot with a bluff after a reraise from a tighter range.
+  preflop_tilt = _opponent.preflop_range_tilt(game_state)
+  avoid_reraise = preflop_tilt >= 0.15 and equity < 0.5
+  if (not avoid_reraise and _opponent_stack(game_state)
+      and _effective_total_bet(game_state, min_raise) == min_raise):
     responses = _opponent.action_probabilities(
       game_state["street"], facing_bet=True
     )
     fold_probability = responses["fold"]
     pot_after_call = game_state["pot"] + game_state["amount_owed"]
     current_bet = game_state["current_bet"]
+    facing_preflop_raise = (
+      game_state["street"] == "preflop"
+      and not can_check
+      and any(
+        event["bot_id"] != game_state["your_bot_id"] and event["action"] in ("raise", "all_in")
+        for event in game_state.get("action_log", [])
+      )
+    )
+    candidate_sizes = [min_raise, current_bet + pot_after_call // 2]
+    if not facing_preflop_raise:
+      candidate_sizes.append(current_bet + pot_after_call)
     targets = {
       _effective_total_bet(game_state, max(min_raise, target))
-      for target in (min_raise, current_bet + pot_after_call // 2, current_bet + pot_after_call)
+      for target in candidate_sizes
     }
     for target in sorted(targets):
       raise_ev = ev_calc_raise(game_state, target, equity, response_probabilities=responses)
