@@ -26,7 +26,7 @@ def _preflop_strength(first, second):
 
 
 _PREFLOP_STRENGTH = {
-  (first, second): _preflop_strength(str(first), str(second))
+  (first, second): _preflop_strength(str(first), str(second)) ** 2
   for first, second in combinations(_DECK, 2)
 }
 _MEAN_PREFLOP_STRENGTH = sum(_PREFLOP_STRENGTH.values()) / len(_PREFLOP_STRENGTH)
@@ -58,6 +58,7 @@ class Opponent:
     }
     self._round_complete = False
     self._preflop_raiser = None
+    self._last_reraise_sample_hand = None
     self._reraise_chances = 0
     self._reraises = 0
 
@@ -108,7 +109,10 @@ class Opponent:
           if street == "river" and facing_bet and self._pot:
             large_bet = (highest_bet - committed) / self._pot >= self._LARGE_BET_PRICE
             self._river_responses[large_bet][action] += 1
-          if street == "preflop" and facing_bet and self._preflop_raiser == our_id:
+          if (street == "preflop" and facing_bet and self._preflop_raiser == our_id
+              and event["hand_num"] != self._last_reraise_sample_hand):
+            # Multiple raises in a single hand are correlated evidence.
+            self._last_reraise_sample_hand = event["hand_num"]
             self._reraise_chances += 1
             self._reraises += action in ("raise", "all_in") and event["amount"] > highest_bet
 
@@ -144,16 +148,32 @@ class Opponent:
       return 0.0
     our_id = game_state["your_bot_id"]
     our_raise = False
+    facing_reraise = False
+    opponent_raises = 0
+    highest_bet = 0
     for event in game_state.get("action_log", []):
-      if event["action"] not in ("raise", "all_in"):
+      action = event["action"]
+      if action in ("small_blind", "big_blind"):
+        highest_bet = max(highest_bet, event["amount"])
+      if action not in ("raise", "all_in") or event["amount"] <= highest_bet:
         continue
+      highest_bet = event["amount"]
       if event["bot_id"] == our_id:
         our_raise = True
-      elif our_raise and event["amount"] > game_state["your_bet_this_street"]:
-        # Start with three reraises in ten hypothetical opportunities.
-        rate = (self._reraises + 3) / (self._reraise_chances + 10)
-        return 0.6 * max(0.0, 1.0 - rate / 0.65)
-    return 0.0
+        facing_reraise = False
+      else:
+        opponent_raises += 1
+        facing_reraise = our_raise
+    if not facing_reraise:
+      return 0.0
+
+    # Start with three reraises in ten hypothetical opportunities.
+    rate = (self._reraises + 3) / (self._reraise_chances + 10)
+    tightness = max(0.0, 1.0 - rate / 0.65)
+    # A second raise on the same line represents a stronger range, especially
+    # from an opponent who rarely reraises across different hands.
+    depth_weight = 0.6 if opponent_raises == 1 else 1.35
+    return min(0.9, depth_weight * tightness)
 
   def river_range_weights(self, game_state, hand_scores):
     """Weight possible hands after an observed river bet or raise."""
